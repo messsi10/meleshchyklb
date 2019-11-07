@@ -1,0 +1,412 @@
+
+---
+#Start creating security group
+- hosts: localhost
+  vars:
+        aws_access_key: AKIA2U4FWRFBY5L3BWMK
+        aws_secret_key: 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
+          #ansible_ssh_private_key_file: /etc/ansible/aws       
+  tasks:
+    - name: Get my current IP address
+      uri:
+        url: http://checkip.amazonaws.com/
+        return_content: yes
+      register: my_ip
+
+    - name: Create simple security group
+      ec2_group:
+        name: servers
+        description: A security group for server
+        region: eu-central-1
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0 #"{{ my_ip.content | replace('\n', '') }}/32"
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0 #"{{ my_ip.content | replace('\n', '') }}/32"
+          - proto: tcp
+            from_port: 8983
+            to_port: 8983
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 2888
+            to_port: 2888
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 3888
+            to_port: 3888
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 2181
+            to_port: 2181
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 2182
+            to_port: 2182
+            cidr_ip: 0.0.0.0/0            
+          - proto: tcp
+            from_port: 2183
+            to_port: 2183
+            cidr_ip: 0.0.0.0/0            
+        rules_egress:
+          - proto: tcp
+            from_port: 2181
+            to_port: 2181
+            cidr_ip: 0.0.0.0/0            
+          - proto: tcp
+            from_port: 2182
+            to_port: 2182
+            cidr_ip: 0.0.0.0/0            
+          - proto: tcp
+            from_port: 2183
+            to_port: 2183     
+            cidr_ip: 0.0.0.0/0            
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8983
+            to_port: 8983
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 2888
+            to_port: 2888
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 3888
+            to_port: 3888
+            cidr_ip: 0.0.0.0/0
+            
+      register: webservers_group
+
+      #Finish creating security group
+      
+      #Start creating ELB
+    - name: Create the ELB
+      ec2_elb_lb:
+        name: ansibleloadbalancer
+        security_group_names: 'meleshchyk'
+        state: present
+        region: eu-central-1
+        zones:
+          - eu-central-1a  
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 8983
+          - protocol: https
+            load_balancer_port: 443
+            instance_protocol: http
+            instance_port: 8983
+            ssl_certificate_id: "arn:aws:acm:eu-central-1:732035451203:certificate/be9e4548-986a-4181-ac0d-2cb3084a6392" 
+        health_check:
+                #ping_protocol: tcp
+            #ping_port: 8983    
+            ping_protocol: http # options are http, https, ssl, tcp
+            ping_port: 80
+            ping_path: "/index.html"
+            response_timeout: 5 # seconds
+            interval: 30 # seconds
+            unhealthy_threshold: 2
+            healthy_threshold: 10    
+      register: elb
+      #Finish creating ELB
+      
+      #Creating EC2 Instances
+    - name: Create EC2 instances
+      ec2:
+        key_name: aws
+        instance_type: t2.micro
+        image: ami-0cc0a36f626a4fdf5
+        region: eu-central-1
+        group_id:
+          - "{{ webservers_group.group_id }}"
+          - "{{ elb.elb.security_group_ids | first }}"
+        wait: yes
+        instance_tags:
+          application: ansiblenodes
+        exact_count: 3
+        count_tag:
+          application: ansiblenodes
+      register: ec2_instances
+
+
+      #Finish creating EC2 Instances
+
+      #Start adding host as known
+
+    - name: Store EC2 instance IPs to provision against
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groupname: ec2_instance_ips
+      with_items: "{{ ec2_instances.tagged_instances }}"
+
+    - name: Wait for servers to come online
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        timeout: 180
+      with_items: "{{ ec2_instances.tagged_instances }}"
+
+    - name: Add EC2 instances as known hosts
+      known_hosts:
+        name: "{{ item.public_ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_ip) }}"
+      with_items: "{{ ec2_instances.tagged_instances }}" 
+      #Finish adding host as known
+      
+      #Start installing webservers
+- hosts: ec2_instance_ips
+  remote_user: ubuntu
+  become: True
+  tasks:
+     - name: Update and upgrade apt packages
+       become: true
+       apt:
+         upgrade: yes
+         update_cache: yes   
+     - name: Install nginx
+       apt:
+         name: nginx
+         state: latest
+     - name: Create default index page
+       copy:
+         dest: /var/www/html/index.html
+         content: "Hello from {{ ansible_hostname }}"
+     - name: Restart nginx
+       service:
+         name: nginx
+         state: restarted
+      #Finish installing webserver
+
+      #Attaching server to LB
+- hosts: localhost
+  tasks:
+     - name: Add each EC2 instance to the ELB
+       ec2_elb:
+         state: present
+         ec2_elbs: ansibleloadbalancer
+         region: eu-central-1
+         instance_id: "{{ item.id }}"
+       with_items: "{{ ec2_instances.tagged_instances }}"
+       #Finish attaching servers to LB
+     
+           #Creating EC2 Instance for Zookeeper
+     - name: Create EC2 instances
+       ec2:
+         key_name: aws
+         instance_type: t2.micro
+         image: ami-0cc0a36f626a4fdf5
+         region: eu-central-1
+         group_id:
+           - "{{ webservers_group.group_id }}"
+           - "{{ elb.elb.security_group_ids | first }}"
+         wait: yes
+         instance_tags:
+           application: zookeepernode
+         exact_count: 1
+         count_tag:
+           application: zookeepernode
+       register: ec2_instances
+       # Finish creating EC2 Instance for Zookeeper
+       #Start adding Zookeeper host as known
+
+     - name: Store EC2 instance IPs to provision against
+       add_host:
+         hostname: "{{ item.public_ip }}"
+         groupname: zookeeper_instance
+       with_items: "{{ ec2_instances.tagged_instances }}"
+
+     - name: Wait for server to come online
+       wait_for:
+         host: "{{ item.public_ip }}"
+         port: 22
+         timeout: 180
+       with_items: "{{ ec2_instances.tagged_instances }}"
+
+     - name: Add EC2 instances as known hosts
+       known_hosts:
+         name: "{{ item.public_ip }}"
+         key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_ip) }}"
+       with_items: "{{ ec2_instances.tagged_instances }}"
+      #Finish adding Zookeper  host as known
+
+
+       #Start configure Zookeepers 
+
+- hosts: zookeeper_instance
+  remote_user: ubuntu
+  become: True
+  tasks:
+     - name: Update and upgrade apt packages
+       become: true
+       apt:
+         upgrade: yes
+         update_cache: yes
+     - name: Install java
+       become: true
+       apt:
+         name: default-jre
+         name: default-jdk
+         state: latest
+         install_recommends: no 
+     - name: Stop AppArmor
+       service:
+         name: apparmor
+         state: stopped
+     - name: Download Zookeeper
+       get_url:
+         url: http://apache.mirror.digitalpacific.com.au/zookeeper/zookeeper-3.4.14/zookeeper-3.4.14.tar.gz
+         dest: /opt
+     - name: Extract Zookeeper
+       unarchive:
+         src: /opt/zookeeper-3.4.14.tar.gz
+         dest: /opt
+         remote_src: yes
+     - name: Move zookeeper
+       command: mv /opt/zookeeper-3.4.14  /opt/zookeeper
+       args:
+         creates: /opt/zookeeper
+
+     - name: Copying conf files
+       copy:
+         src: /etc/ansible/zoo_confs/zoo.cfg
+         dest: /opt/zookeeper/conf/zoo.cfg
+         owner: root
+         group: root
+         mode: 0644
+         backup: yes    
+     - name: Copying conf files
+       copy:
+         src: /etc/ansible/zoo_confs/zoo2.cfg
+         dest: /opt/zookeeper/conf/zoo2.cfg
+         owner: root
+         group: root
+         mode: 0644
+         backup: yes
+     - name: Copying conf files
+       copy:
+         src: /etc/ansible/zoo_confs/zoo3.cfg
+         dest: /opt/zookeeper/conf/zoo3.cfg
+         owner: root
+         group: root
+         mode: 0644
+         backup: yes
+     - name: Create a zookeeperdata directory if it does not exist
+       file:
+         path: /opt/zookeeper/zookeeperdata  
+         state: directory
+         mode: '0755'
+     - name: Create a zookeeperdata directory if it does not exist
+       file:
+         path: /opt/zookeeper/zookeeperdata/1
+         state: directory
+         mode: '0755'
+     - name: Create a zookeeperdata directory if it does not exist
+       file:
+         path: /opt/zookeeper/zookeeperdata/2
+         state: directory
+         mode: '0755'
+     - name: Create a zookeeperdata directory if it does not exist
+       file:
+         path: /opt/zookeeper/zookeeperdata/3
+         state: directory
+         mode: '0755'
+     - name: Creating myid file  
+       shell: echo '1' > /opt/zookeeper/zookeeperdata/1/myid
+     - name: Creating myid file
+       shell: echo '2' > /opt/zookeeper/zookeeperdata/2/myid
+     - name: Creating myid file
+       shell: echo '3' > /opt/zookeeper/zookeeperdata/3/myid
+     - name: Run a script with arguments
+       shell: /opt/zookeeper/bin/zkServer.sh start  /opt/zookeeper/conf/zoo.cfg     
+     - name: Run a script with arguments
+       shell: /opt/zookeeper/bin/zkServer.sh start  /opt/zookeeper/conf/zoo2.cfg
+     - name: Run a script with arguments
+       shell: /opt/zookeeper/bin/zkServer.sh start  /opt/zookeeper/conf/zoo3.cfg
+       
+       # Stop configure Zookeeper instance
+      
+
+       #Start configure Solr Cloud
+
+
+- hosts: ec2_instance_ips
+  remote_user: ubuntu
+  become: True
+  tasks:
+     - name: Update and upgrade apt packages
+       become: true
+       apt:
+         upgrade: yes
+         update_cache: yes
+     - name: Install java
+       become: true
+       apt:
+         name: default-jre
+         name: default-jdk
+         state: latest
+         install_recommends: no
+     - name: Stop AppArmor
+       service:
+         name: apparmor
+         state: stopped
+     - name: Download SolrCloud
+       get_url:
+         url: http://archive.apache.org/dist/lucene/solr/7.4.0/solr-7.4.0.tgz
+         dest: /opt
+     - name: Extract Solr
+       unarchive:
+         src: /opt/solr-7.4.0.tgz
+         dest: /opt
+         remote_src: yes
+     - name: Move Solr
+       command: mv /opt/solr-7.4.0  /opt/solr
+       args:
+         creates: /opt/solr
+     - name: Copying conf files
+       copy:
+         src: /etc/ansible/security/security.json
+         dest: /opt/solr/security.json
+         owner: root
+         group: root
+         mode: 0644
+         backup: yes
+     - name: Copying conf files
+       copy:
+         src: /etc/ansible/solr_sh/solr.in.sh
+         dest: /opt/solr/bin/solr.in.sh
+         owner: root
+         group: root
+         mode: 0755
+         backup: yes
+     - name: Change Logs directory  ownership, group and permissions
+       file:
+         path: /opt/solr/server/logs
+         state: directory
+         mode: '0755'
+         path: /opt/solr/server/logs
+         owner: root
+         group: root
+         mode: '0777'
+     - name: Set facts
+       set_fact:
+        ec2_instances: "{{ hostvars['localhost']['ec2_instances'] }}"
+     - name: Run a script with arguments
+       shell: "/opt/solr/bin/solr start -c -p 8983 -z {{ ec2_instances.tagged_instances.0.public_ip }}:2181,{{ ec2_instances.tagged_instances.0.public_ip }}:2182,{{ ec2_instances.tagged_instances.0.public_ip }}:2183 -force"
+     - name: Share serurity.json
+       shell: "/opt/solr/bin/solr zk cp file:/opt/solr/security.json zk:/security.json -z {{ ec2_instances.tagged_instances.0.public_ip }}:2181,{{ ec2_instances.tagged_instances.0.public_ip }}:2182,{{ ec2_instances.tagged_instances.0.public_ip }}:2183"
+     - name: Change password
+       uri: 
+         url: http://localhost:8983/solr/admin/authentication 
+         user: solr
+         password: SolrRocks
+         method: POST
+         body: '{"set-user":{"solr" : "solr"}}'
+         body_format: json         
+         headers: 
+           Content-type: "application/json"
