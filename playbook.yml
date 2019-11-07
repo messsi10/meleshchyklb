@@ -3,9 +3,6 @@
 #Start creating security group
 - hosts: localhost
   vars:
-        aws_access_key: AKIA2U4FWRFBY5L3BWMK
-        aws_secret_key: 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
-          #ansible_ssh_private_key_file: /etc/ansible/aws       
   tasks:
     - name: Get my current IP address
       uri:
